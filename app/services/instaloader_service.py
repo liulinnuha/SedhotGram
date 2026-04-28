@@ -51,7 +51,7 @@ class InstaLoaderService:
             try:
                 self._loader.load_session_from_file(username, session_file)
                 self._authenticated = True
-                logger.info("InstaLoader: session loaded from file.")
+                logger.warning("InstaLoader: session loaded from file.")
                 return
             except Exception as exc:
                 logger.warning("Could not load session file: %s", exc)
@@ -61,7 +61,7 @@ class InstaLoaderService:
                 self._loader.login(username, password)
                 self._loader.save_session_to_file(session_file)
                 self._authenticated = True
-                logger.info("InstaLoader: logged in as %s.", username)
+                logger.warning("InstaLoader: logged in as %s.", username)
             except Exception as exc:
                 logger.warning("InstaLoader login failed: %s", exc)
         else:

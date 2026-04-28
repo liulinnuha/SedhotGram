@@ -1,7 +1,9 @@
 import logging
 import uuid
+import asyncio
+
 from app.core.config import settings
-from app.core.exceptions import DownloadJobNotFound
+from app.core.exceptions import DownloadJobNotFound, InvalidInstagramURL
 from app.db.mongodb import get_db
 from app.models.job import DownloadJob, JobStatus, MediaType
 from app.schemas.job import (
@@ -11,10 +13,9 @@ from app.schemas.job import (
     JobStatusResponse,
     DeleteJobResponse,
     MediaURLResponse,
-    DirectDownloadResponse
+    MediaURLItem,
+    DirectDownloadResponse,
 )
-import asyncio
-from app.core.exceptions import InvalidInstagramURL
 from app.services.instaloader_service import instaloader_service
 from app.services.job_repository import JobRepository
 from app.workers.queue_manager import enqueue_job
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 class DownloadService:
     async def _repo(self) -> JobRepository:
         return JobRepository(get_db())
+
+    # ── Async queue jobs ──────────────────────────────────────────────────────
 
     async def create_job(self, request: DownloadRequest) -> JobCreatedResponse:
         media_type, shortcode = instaloader_service.detect_media_type(request.url)
@@ -79,7 +82,10 @@ class DownloadService:
             return
 
         await repo.update_status(job_id, JobStatus.PROCESSING)
-        logger.info("Processing job %s | type=%s | shortcode=%s", job_id, job.media_type, job.shortcode)
+        logger.info(
+            "Processing job %s | type=%s | shortcode=%s",
+            job_id, job.media_type, job.shortcode,
+        )
 
         try:
             if job.media_type in (MediaType.POST, MediaType.REEL):
@@ -109,15 +115,16 @@ class DownloadService:
                 logger.error("Job %s FAILED after %d retries: %s", job_id, retries, exc)
             else:
                 await repo.update_status(job_id, JobStatus.PENDING, str(exc))
-                await asyncio.sleep(5)          # ← wait 5s before re-queuing
+                await asyncio.sleep(5)
                 await enqueue_job(job_id)
                 logger.warning("Job %s re-queued (attempt %d): %s", job_id, retries, exc)
 
-    async def get_media_urls(self, url: str) -> "MediaURLResponse":
-        from app.schemas.job import MediaURLResponse, MediaURLItem
+    # ── URL-only (no download) ─────────────────────────────────────────────────
+
+    async def get_media_urls(self, url: str) -> MediaURLResponse:
         media_type, shortcode = instaloader_service.detect_media_type(url)
         if media_type not in (MediaType.POST, MediaType.REEL):
-            raise InvalidInstagramURL(url)   # only posts/reels have extractable CDN URLs
+            raise InvalidInstagramURL(url)
         result = await asyncio.to_thread(instaloader_service.get_media_urls, shortcode)
         return MediaURLResponse(
             shortcode=result["shortcode"],
@@ -129,7 +136,10 @@ class DownloadService:
             media=[MediaURLItem(**item) for item in result["media"]],
         )
 
-    async def download_direct(self, url: str) -> "DirectDownloadResponse":
+    # ── Direct (sync) downloads ───────────────────────────────────────────────
+
+    async def download_direct(self, url: str) -> DirectDownloadResponse:
+        """Original generic direct download (POST /downloads/direct)."""
         media_type, shortcode = instaloader_service.detect_media_type(url)
         if media_type not in (MediaType.POST, MediaType.REEL):
             raise InvalidInstagramURL(url)
@@ -144,5 +154,59 @@ class DownloadService:
             files=files,
             duration_seconds=elapsed,
         )
+
+    async def download_direct_by_type(self, url: str, expected_prefix: str) -> DirectDownloadResponse:
+        """
+        Used by /direct/post and /direct/reel.
+        Validates that the URL matches the expected path prefix before downloading.
+        """
+        if expected_prefix not in url:
+            raise InvalidInstagramURL(url)
+        return await self.download_direct(url)
+
+    async def download_profile_direct(self, url: str) -> DirectDownloadResponse:
+        """Used by GET /direct/profile."""
+        import time
+        media_type, username = instaloader_service.detect_media_type(url)
+        if media_type not in (MediaType.PROFILE, MediaType.PROFILE_ALL):
+            raise InvalidInstagramURL(url)
+
+        start = time.perf_counter()
+        files, meta = await asyncio.to_thread(
+            instaloader_service.download_profile_pic, username
+        )
+        elapsed = round(time.perf_counter() - start, 2)
+
+        return DirectDownloadResponse(
+            job_id=str(uuid.uuid4()),
+            shortcode=username,
+            owner_username=meta.get("owner_username", username),
+            caption=meta.get("caption", ""),
+            files=files,
+            duration_seconds=elapsed,
+        )
+
+    async def download_highlight_direct(self, url: str) -> DirectDownloadResponse:
+        """Used by GET /direct/highlight."""
+        import time
+        media_type, highlight_id = instaloader_service.detect_media_type(url)
+        if media_type != MediaType.HIGHLIGHT:
+            raise InvalidInstagramURL(url)
+
+        start = time.perf_counter()
+        files, meta = await asyncio.to_thread(
+            instaloader_service.download_highlight, highlight_id
+        )
+        elapsed = round(time.perf_counter() - start, 2)
+
+        return DirectDownloadResponse(
+            job_id=str(uuid.uuid4()),
+            shortcode=highlight_id,
+            owner_username=meta.get("owner_username", ""),
+            caption=meta.get("caption", ""),
+            files=files,
+            duration_seconds=elapsed,
+        )
+
 
 download_service = DownloadService()
